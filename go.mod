@@ -28,3 +28,5 @@ require (
 	golang.org/x/text v0.3.7 // indirect
 	google.golang.org/genproto v0.0.0-20220707150051-590a5ac7bee1 // indirect
 )
+
+replace github.com/Kana-v1-exchange/enviroment => ../enviroment

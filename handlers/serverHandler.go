@@ -5,18 +5,25 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"sync"
+	"time"
 
-	proto "github.com/Kana-v1-exchange/dashboard/protos/handlers/serverHandler"
+	"github.com/Kana-v1-exchange/dashboard/helpers"
 	postgres "github.com/Kana-v1-exchange/enviroment/postgres"
+	proto "github.com/Kana-v1-exchange/enviroment/protos/serverHandler"
 	redis "github.com/Kana-v1-exchange/enviroment/redis"
 	rmq "github.com/Kana-v1-exchange/enviroment/rmq"
 	"golang.org/x/crypto/bcrypt"
+	"google.golang.org/grpc/metadata"
 )
 
 type ServerHandler struct {
 	postgresHandler postgres.PostgresHandler
 	redisHandler    redis.RedisHandler
 	rmqHandler      rmq.RmqHandler
+
+	transaction *sync.Mutex
 
 	proto.UnimplementedDashboardServiceServer
 }
@@ -50,8 +57,7 @@ func (sh *ServerHandler) SignUp(ctx context.Context, user *proto.User) (*proto.D
 			return
 		}
 
-		msg <- "user has been signed in"
-
+		msg <- "user has been signed up"
 	}(msg, errCh)
 
 	select {
@@ -62,4 +68,159 @@ func (sh *ServerHandler) SignUp(ctx context.Context, user *proto.User) (*proto.D
 	case err := <-errCh:
 		return nil, fmt.Errorf("cannot sign in; err: %v", err)
 	}
+}
+
+func (sh *ServerHandler) SignIn(ctx context.Context, user *proto.User) (*proto.DefaultStringMsg, error) {
+	msg := make(chan string)
+	errCh := make(chan error)
+
+	go func(msg chan string, errCh chan error) {
+		userID, dbPass, err := sh.postgresHandler.GetUserData(user.Email)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				errCh <- errors.New("invalid email")
+				return
+			}
+			errCh <- err
+			return
+		}
+
+		if err := bcrypt.CompareHashAndPassword([]byte(dbPass), []byte(user.Password)); err != nil {
+			errCh <- errors.New("invalid password")
+			return
+		}
+
+		expiresAt := time.Now().Add(time.Minute * tokenTime)
+		_, err = sh.redisHandler.GetOrUpdateUserToken(userID, &expiresAt)
+		if err != nil {
+			errCh <- err
+			return
+		}
+
+		msg <- "succesfully signed in"
+	}(msg, errCh)
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("context has been canceled")
+	case message := <-msg:
+		return &proto.DefaultStringMsg{Message: message}, nil
+	case err := <-errCh:
+		return nil, err
+	}
+}
+
+func (sh *ServerHandler) GetAllCurrencies(ctx context.Context, _ *proto.EmptyMsg) (*proto.GetCurrenciesResponse, error) {
+	response := make(chan *proto.GetCurrenciesResponse)
+	errCh := make(chan error)
+
+	go func(response chan *proto.GetCurrenciesResponse, errCh chan error) {
+		currencies, err := sh.postgresHandler.GetCurrencies()
+		if err != nil {
+			errCh <- err
+			return
+		}
+
+		curValues := make([]*proto.CurrencyValue, 0, len(currencies))
+
+		for currency, value := range currencies {
+			curValues = append(curValues, &proto.CurrencyValue{
+				Value:    float32(value),
+				Currency: currency,
+			})
+		}
+
+		response <- &proto.GetCurrenciesResponse{CurrencyValue: curValues}
+	}(response, errCh)
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("context has been canceled")
+	case msg := <-response:
+		return msg, nil
+	case err := <-errCh:
+		return nil, err
+	}
+}
+
+func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOperation) (*proto.DefaultStringMsg, error) {
+	msg := make(chan *proto.DefaultStringMsg)
+	errCh := make(chan error)
+
+	go func(msg chan *proto.DefaultStringMsg, errCh chan error) {
+		if md, ok := metadata.FromIncomingContext(ctx); ok {
+			userID, err := strconv.ParseUint(md.Get("userID")[0], 10, 64)
+			if err != nil {
+				errCh <- fmt.Errorf("%wcannot get userID from the context metadata; err: %v", helpers.ErrInternal, err)
+				return
+			}
+
+			if err := sh.isUserAlive(userID); err != nil {
+				if errors.Is(err, helpers.ErrInternal) {
+					errCh <- fmt.Errorf("%winternal err: %v", helpers.ErrInternal, err.Error())
+				} else {
+					errCh <- err
+				}
+
+				return
+			}
+
+			sh.transaction.Lock()
+			defer sh.transaction.Unlock()
+
+			sellerID, err := sh.postgresHandler.FindSeller(sellInfo.CurrencyValue.Currency, float64(sellInfo.CurrencyValue.Value))
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			currencyVal, err := sh.postgresHandler.GetCurrencyValue(sellInfo.CurrencyValue.Currency)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			usdToTransact := currencyVal * float64(sellInfo.CurrencyValue.Value)
+
+			// send USD to a seller
+			err = sh.postgresHandler.SendCurrency(uint64(sellInfo.UserID), sellerID, "USD", usdToTransact)
+			if err != nil {
+				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
+			}
+
+			// send currency to a buyer
+			err = sh.postgresHandler.SendCurrency(sellerID, uint64(sellInfo.UserID), sellInfo.CurrencyValue.Currency, float64(sellInfo.CurrencyValue.Value))
+			if err != nil {
+				// rollback if error
+				sh.postgresHandler.SendCurrency(sellerID, uint64(sellInfo.UserID), "USD", usdToTransact)
+
+				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
+				return
+			}
+
+			msg <- &proto.DefaultStringMsg{Message: fmt.Sprintf("%v %v has been bought", sellInfo.CurrencyValue.Value, sellInfo.CurrencyValue.Currency)}
+		}
+	}(msg, errCh)
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("context has been canceled")
+	case message := <-msg:
+		return message, nil
+	case err := <-errCh:
+		return nil, err
+	}
+}
+
+func (sh *ServerHandler) isUserAlive(userID uint64) error {
+	expiresAt, err := sh.redisHandler.GetOrUpdateUserToken(userID, nil)
+	if err != nil {
+		return fmt.Errorf("%w%v", helpers.ErrInternal, err)
+	}
+
+	if time.Now().After(expiresAt) {
+		return errors.New("user's token has already been expired")
+	}
+
+	return nil
 }
