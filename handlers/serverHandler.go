@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -199,6 +200,8 @@ func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOp
 			}
 
 			msg <- &proto.DefaultStringMsg{Message: fmt.Sprintf("%v %v has been bought", sellInfo.CurrencyValue.Value, sellInfo.CurrencyValue.Currency)}
+		} else {
+			errCh <- fmt.Errorf("%wrequest doesn't contain metadata", helpers.ErrInternal)
 		}
 	}(msg, errCh)
 
@@ -206,9 +209,112 @@ func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOp
 	case <-ctx.Done():
 		return nil, fmt.Errorf("context has been canceled")
 	case message := <-msg:
+		err := sh.redisHandler.Increment(sellInfo.CurrencyValue.Currency + redis.RedisCurrencyOperationsSuffix)
+		if err != nil {
+			return nil, fmt.Errorf("%wcannot increment the number of the operations with the currency %v; err: %v", helpers.ErrInternal, sellInfo.CurrencyValue.Currency, err)
+		}
+
 		return message, nil
 	case err := <-errCh:
 		return nil, err
+	}
+}
+
+func (sh *ServerHandler) SellCurrency(ctx context.Context, sellInfo *proto.SellOperation) (*proto.DefaultStringMsg, error) {
+	msg := make(chan *proto.DefaultStringMsg)
+	errCh := make(chan error)
+
+	go func(msg chan *proto.DefaultStringMsg, errCh chan error) {
+		if md, ok := metadata.FromIncomingContext(ctx); ok {
+			userID, err := strconv.ParseUint(md.Get("userID")[0], 10, 64)
+			if err != nil {
+				errCh <- fmt.Errorf("%wcannot get userID from the context metadata; err: %v", helpers.ErrInternal, err)
+				return
+			}
+
+			if err := sh.isUserAlive(userID); err != nil {
+				if errors.Is(err, helpers.ErrInternal) {
+					errCh <- fmt.Errorf("%winternal err: %v", helpers.ErrInternal, err.Error())
+				} else {
+					errCh <- err
+				}
+
+				return
+			}
+
+			currencyValue, err := sh.postgresHandler.GetCurrencyAmount(sellInfo.CurrencyValue.Currency)
+			if err != nil {
+				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
+				return
+			}
+
+			usdToSell := currencyValue * float64(sellInfo.CurrencyValue.Value)
+			availableUSD, err := sh.postgresHandler.GetUserMoney(uint64(sellInfo.UserID), sellInfo.CurrencyValue.Currency)
+			if err != nil {
+				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
+				return
+			}
+
+			if availableUSD < usdToSell {
+				errCh <- fmt.Errorf("user has %v USD, but wants to sell %v", availableUSD, usdToSell)
+				return
+			}
+
+			sh.transaction.Lock()
+			defer sh.transaction.Unlock()
+
+			err = sh.postgresHandler.UpdateCurrencyAmount(uint64(sellInfo.UserID), "USD", availableUSD-usdToSell)
+			if err != nil {
+				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
+			}
+
+			err = sh.postgresHandler.UpdateCurrencyAmount(uint64(sellInfo.UserID), sellInfo.CurrencyValue.Currency, float64(sellInfo.CurrencyValue.Value))
+			if err != nil {
+				fullErr := fmt.Errorf("%w%v", helpers.ErrInternal, err)
+				err = sh.postgresHandler.UpdateCurrencyAmount(uint64(sellInfo.UserID), "USD", availableUSD)
+				if err != nil {
+					fullErr = fmt.Errorf("%v. Also cannot rollback a transaction", fullErr)
+				}
+
+				errCh <- fullErr
+			}
+		} else {
+			errCh <- fmt.Errorf("%wrequest doesn't contain metadata", helpers.ErrInternal)
+		}
+	}(msg, errCh)
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("context has been canceled")
+	case message := <-msg:
+		err := sh.redisHandler.Increment(sellInfo.CurrencyValue.Currency + redis.RedisCurrencyOperationsSuffix)
+		if err != nil {
+			return nil, fmt.Errorf("%wcannot increment the number of the operations with the currency %v; err: %v", helpers.ErrInternal, sellInfo.CurrencyValue.Currency, err)
+		}
+
+		return message, nil
+	case err := <-errCh:
+		return nil, err
+	}
+}
+
+func (sh *ServerHandler) GetCurrencyValue(currency *proto.DefaultStringMsg, stream proto.DashboardService_GetCurrencyValueServer) error {
+	msgs, err := sh.rmqHandler.Read()
+	if err != nil {
+		return fmt.Errorf("%cannot read from the rmq queue; err: %v", helpers.ErrInternal, err)
+	}
+
+	for {
+		message := <-msgs
+		parsedMessage := new(proto.CurrencyValue)
+		err := json.Unmarshal(message.Body, &parsedMessage)
+		if err != nil {
+			return fmt.Errorf("%wcannot parse rmq message (%s); err: %v", helpers.ErrInternal, message.Body, err)
+		}
+
+		if parsedMessage.Currency == currency.Message {
+			stream.Send(&proto.DefaultFloatMsg{Value: parsedMessage.Value})
+		}
 	}
 }
 

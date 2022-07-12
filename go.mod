@@ -3,7 +3,7 @@ module github.com/Kana-v1-exchange/dashboard
 go 1.18
 
 require (
-	github.com/Kana-v1-exchange/enviroment v0.0.0-20220708143659-7e0fe999774d
+	github.com/Kana-v1-exchange/enviroment v0.0.0-20220712095522-3474baa3ad95
 	google.golang.org/grpc v1.47.0
 	google.golang.org/protobuf v1.28.0
 )
@@ -22,11 +22,9 @@ require (
 	github.com/jackc/pgtype v1.11.0 // indirect
 	github.com/jackc/pgx/v4 v4.16.1 // indirect
 	github.com/rabbitmq/amqp091-go v1.3.4 // indirect
-	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d // indirect
-	golang.org/x/net v0.0.0-20220706163947-c90051bbdb60 // indirect
-	golang.org/x/sys v0.0.0-20220708085239-5a0f0661e09d // indirect
+	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d
+	golang.org/x/net v0.0.0-20220708220712-1185a9018129 // indirect
+	golang.org/x/sys v0.0.0-20220712014510-0a85c31ab51e // indirect
 	golang.org/x/text v0.3.7 // indirect
-	google.golang.org/genproto v0.0.0-20220707150051-590a5ac7bee1 // indirect
+	google.golang.org/genproto v0.0.0-20220711200234-e2551ce405a2 // indirect
 )
-
-replace github.com/Kana-v1-exchange/enviroment => ../enviroment
