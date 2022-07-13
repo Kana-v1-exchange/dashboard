@@ -3,7 +3,7 @@ module github.com/Kana-v1-exchange/dashboard
 go 1.18
 
 require (
-	github.com/Kana-v1-exchange/enviroment v0.0.0-20220712095522-3474baa3ad95
+	github.com/Kana-v1-exchange/enviroment v0.0.0-20220713120814-a7fbbf349e08
 	google.golang.org/grpc v1.47.0
 	google.golang.org/protobuf v1.28.0
 )
@@ -21,6 +21,7 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20200714003250-2b9c44734f2b // indirect
 	github.com/jackc/pgtype v1.11.0 // indirect
 	github.com/jackc/pgx/v4 v4.16.1 // indirect
+	github.com/joho/godotenv v1.4.0
 	github.com/rabbitmq/amqp091-go v1.3.4 // indirect
 	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d
 	golang.org/x/net v0.0.0-20220708220712-1185a9018129 // indirect

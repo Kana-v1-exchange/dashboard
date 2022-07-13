@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 	proto "github.com/Kana-v1-exchange/enviroment/protos/serverHandler"
 	redis "github.com/Kana-v1-exchange/enviroment/redis"
 	rmq "github.com/Kana-v1-exchange/enviroment/rmq"
+	"github.com/jackc/pgx/v4"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/metadata"
 )
@@ -31,13 +31,23 @@ type ServerHandler struct {
 
 const tokenTime = 120
 
+func NewServerHandler(p postgres.PostgresHandler, r redis.RedisHandler, rmq rmq.RmqHandler) *ServerHandler {
+	return &ServerHandler{
+		postgresHandler: p,
+		redisHandler:    r,
+		rmqHandler:      rmq,
+
+		transaction: new(sync.Mutex),
+	}
+}
+
 func (sh *ServerHandler) SignUp(ctx context.Context, user *proto.User) (*proto.DefaultStringMsg, error) {
 	msg := make(chan string)
 	errCh := make(chan error)
 	go func(msg chan string, errCh chan error) {
 		_, _, err := sh.postgresHandler.GetUserData(user.Email)
 		if err != nil {
-			if !errors.Is(err, sql.ErrNoRows) {
+			if !errors.Is(err, pgx.ErrNoRows) {
 				errCh <- err
 				return
 			}
@@ -78,7 +88,7 @@ func (sh *ServerHandler) SignIn(ctx context.Context, user *proto.User) (*proto.D
 	go func(msg chan string, errCh chan error) {
 		userID, dbPass, err := sh.postgresHandler.GetUserData(user.Email)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+			if errors.Is(err, pgx.ErrNoRows) {
 				errCh <- errors.New("invalid email")
 				return
 			}
@@ -150,13 +160,13 @@ func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOp
 
 	go func(msg chan *proto.DefaultStringMsg, errCh chan error) {
 		if md, ok := metadata.FromIncomingContext(ctx); ok {
-			userID, err := strconv.ParseUint(md.Get("userID")[0], 10, 64)
+			buyerID, err := strconv.ParseUint(md.Get("userID")[0], 10, 64)
 			if err != nil {
 				errCh <- fmt.Errorf("%wcannot get userID from the context metadata; err: %v", helpers.ErrInternal, err)
 				return
 			}
 
-			if err := sh.isUserAlive(userID); err != nil {
+			if err := sh.isUserAlive(buyerID); err != nil {
 				if errors.Is(err, helpers.ErrInternal) {
 					errCh <- fmt.Errorf("%winternal err: %v", helpers.ErrInternal, err.Error())
 				} else {
@@ -183,17 +193,29 @@ func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOp
 
 			usdToTransact := currencyVal * float64(sellInfo.CurrencyValue.Value)
 
-			// send USD to a seller
-			err = sh.postgresHandler.SendCurrency(uint64(sellInfo.UserID), sellerID, "USD", usdToTransact)
+			availableUSD, err := sh.postgresHandler.GetUserMoney(buyerID, "USD")
 			if err != nil {
 				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
+				return
+			}
+
+			if availableUSD < usdToTransact {
+				errCh <- fmt.Errorf("user has %v USD, needs %v to buy %v %v", availableUSD, usdToTransact, sellInfo.CurrencyValue.Value, sellInfo.CurrencyValue.Currency)
+				return
+			}
+
+			// send USD to a seller
+			err = sh.postgresHandler.SendCurrency(buyerID, sellerID, "USD", usdToTransact)
+			if err != nil {
+				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
+				return
 			}
 
 			// send currency to a buyer
-			err = sh.postgresHandler.SendCurrency(sellerID, uint64(sellInfo.UserID), sellInfo.CurrencyValue.Currency, float64(sellInfo.CurrencyValue.Value))
+			err = sh.postgresHandler.SendCurrency(sellerID, buyerID, sellInfo.CurrencyValue.Currency, float64(sellInfo.CurrencyValue.Value))
 			if err != nil {
 				// rollback if error
-				sh.postgresHandler.SendCurrency(sellerID, uint64(sellInfo.UserID), "USD", usdToTransact)
+				sh.postgresHandler.SendCurrency(sellerID, buyerID, "USD", usdToTransact)
 
 				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
 				return
@@ -226,7 +248,13 @@ func (sh *ServerHandler) SellCurrency(ctx context.Context, sellInfo *proto.SellO
 
 	go func(msg chan *proto.DefaultStringMsg, errCh chan error) {
 		if md, ok := metadata.FromIncomingContext(ctx); ok {
-			userID, err := strconv.ParseUint(md.Get("userID")[0], 10, 64)
+			userIDs := md.Get("userID")
+			if len(userIDs) == 0 {
+				errCh <- fmt.Errorf("%wrequest doesn't contain metadata", helpers.ErrInternal)
+				return
+			}
+
+			userID, err := strconv.ParseUint(userIDs[0], 10, 64)
 			if err != nil {
 				errCh <- fmt.Errorf("%wcannot get userID from the context metadata; err: %v", helpers.ErrInternal, err)
 				return
@@ -242,14 +270,14 @@ func (sh *ServerHandler) SellCurrency(ctx context.Context, sellInfo *proto.SellO
 				return
 			}
 
-			currencyValue, err := sh.postgresHandler.GetCurrencyAmount(sellInfo.CurrencyValue.Currency)
+			currencyValue, err := sh.postgresHandler.GetCurrencyValue(sellInfo.CurrencyValue.Currency)
 			if err != nil {
 				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
 				return
 			}
 
 			usdToSell := currencyValue * float64(sellInfo.CurrencyValue.Value)
-			availableUSD, err := sh.postgresHandler.GetUserMoney(uint64(sellInfo.UserID), sellInfo.CurrencyValue.Currency)
+			availableUSD, err := sh.postgresHandler.GetUserMoney(userID, "USD")
 			if err != nil {
 				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
 				return
@@ -263,15 +291,25 @@ func (sh *ServerHandler) SellCurrency(ctx context.Context, sellInfo *proto.SellO
 			sh.transaction.Lock()
 			defer sh.transaction.Unlock()
 
-			err = sh.postgresHandler.UpdateCurrencyAmount(uint64(sellInfo.UserID), "USD", availableUSD-usdToSell)
+			err = sh.postgresHandler.UpdateCurrencyAmount(userID, "USD", availableUSD-usdToSell)
 			if err != nil {
 				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
 			}
 
-			err = sh.postgresHandler.UpdateCurrencyAmount(uint64(sellInfo.UserID), sellInfo.CurrencyValue.Currency, float64(sellInfo.CurrencyValue.Value))
+			alreadyHave, err := sh.postgresHandler.GetUserMoney(userID, sellInfo.CurrencyValue.Currency)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					alreadyHave = 0
+				} else {
+					errCh <- err
+					return
+				}
+			}
+
+			err = sh.postgresHandler.UpdateCurrencyAmount(userID, sellInfo.CurrencyValue.Currency, float64(sellInfo.CurrencyValue.Value)+alreadyHave)
 			if err != nil {
 				fullErr := fmt.Errorf("%w%v", helpers.ErrInternal, err)
-				err = sh.postgresHandler.UpdateCurrencyAmount(uint64(sellInfo.UserID), "USD", availableUSD)
+				err = sh.postgresHandler.UpdateCurrencyAmount(userID, "USD", availableUSD)
 				if err != nil {
 					fullErr = fmt.Errorf("%v. Also cannot rollback a transaction", fullErr)
 				}
@@ -281,6 +319,8 @@ func (sh *ServerHandler) SellCurrency(ctx context.Context, sellInfo *proto.SellO
 		} else {
 			errCh <- fmt.Errorf("%wrequest doesn't contain metadata", helpers.ErrInternal)
 		}
+
+		msg <- &proto.DefaultStringMsg{Message: fmt.Sprintf("%v %v selling now", sellInfo.CurrencyValue.Value, sellInfo.CurrencyValue.Currency)}
 	}(msg, errCh)
 
 	select {
@@ -309,7 +349,7 @@ func (sh *ServerHandler) GetCurrencyValue(currency *proto.DefaultStringMsg, stre
 		parsedMessage := new(proto.CurrencyValue)
 		err := json.Unmarshal(message.Body, &parsedMessage)
 		if err != nil {
-			return fmt.Errorf("%wcannot parse rmq message (%s); err: %v", helpers.ErrInternal, message.Body, err)
+			return fmt.Errorf("%wcannot parse rmq message (%v); err: %v", helpers.ErrInternal, string(message.Body), err)
 		}
 
 		if parsedMessage.Currency == currency.Message {
