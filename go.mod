@@ -3,7 +3,7 @@ module github.com/Kana-v1-exchange/dashboard
 go 1.18
 
 require (
-	github.com/Kana-v1-exchange/enviroment v0.0.0-20220713120814-a7fbbf349e08
+	github.com/Kana-v1-exchange/enviroment v0.0.0-20220713135802-d7b36bcec1a6
 	google.golang.org/grpc v1.47.0
 	google.golang.org/protobuf v1.28.0
 )
