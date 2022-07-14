@@ -209,3 +209,126 @@ func TestBuyCurrency(t *testing.T) {
 			buyerUsdAfterDial)
 	}
 }
+
+func TestBuyCurerncyMoreValueThanExists(t *testing.T) {
+	currencyToBuy := "AUD"
+	amountToBuy := float64(20_000_000)
+
+	redisHandler := mocks.NewRedisHandlerMock()
+	postgresHandler := mocks.NewPostgresHandlerMock()
+
+	serverHandler := handlers.NewServerHandler(
+		postgresHandler,
+		redisHandler,
+		mocks.NewRmqMock(),
+	)
+
+	_, err := serverHandler.SignIn(context.Background(), &proto.User{Email: "buyer", Password: "buyer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	md := metadata.New(map[string]string{"userID": "2"})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+
+	_, err = serverHandler.BuyCurrency(ctx, &proto.SellOperation{
+		CurrencyValue: &proto.CurrencyValue{
+			Value:    float32(amountToBuy),
+			Currency: currencyToBuy,
+		},
+	})
+
+	if err == nil {
+		t.Fatal("can buy more currency than seller has")
+	}
+}
+
+func TestSellSalary(t *testing.T) {
+	currencyToBuy := "AUD"
+	amountToSell := float32(100)
+
+	redisHandler := mocks.NewRedisHandlerMock()
+	postgresHandler := mocks.NewPostgresHandlerMock()
+
+	serverHandler := handlers.NewServerHandler(
+		postgresHandler,
+		redisHandler,
+		mocks.NewRmqMock(),
+	)
+
+	_, err := serverHandler.SignIn(context.Background(), &proto.User{Email: "buyer", Password: "buyer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	md := metadata.New(map[string]string{"userID": "2"})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+
+	currencyAmountBeforeDial, _ := postgresHandler.GetUserMoney(2, currencyToBuy)
+	usdBeforeDial, _ := postgresHandler.GetUserMoney(2, "USD")
+
+	_, err = serverHandler.SellCurrency(ctx, &proto.SellOperation{
+		CurrencyValue: &proto.CurrencyValue{
+			Value:    amountToSell,
+			Currency: currencyToBuy,
+		},
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	currencyAmountAfterDial, _ := postgresHandler.GetUserMoney(2, currencyToBuy)
+	usdAfterDial, _ := postgresHandler.GetUserMoney(2, "USD")
+
+	usdVal, _ := postgresHandler.GetCurrencyValue(currencyToBuy)
+	usdDif := amountToSell * float32(usdVal)
+
+	if currencyAmountAfterDial != currencyAmountBeforeDial+float64(amountToSell) {
+		t.Fatalf("invalid amount of %v after the Dial. Expected: %v, actual: %v",
+			currencyToBuy,
+			float32(currencyAmountBeforeDial)+amountToSell,
+			currencyAmountAfterDial)
+	}
+
+	if usdBeforeDial-float64(usdDif) != usdAfterDial {
+		t.Fatalf("invalid amount of %v after the Dial. Expected: %v, actual: %v",
+			"USD",
+			float32(usdBeforeDial)-usdDif,
+			usdAfterDial)
+	}
+}
+
+func TestSellMoreThanCan(t *testing.T) {
+	currencyToBuy := "AUD"
+	amountToSell := float32(100_000_000)
+
+	redisHandler := mocks.NewRedisHandlerMock()
+	postgresHandler := mocks.NewPostgresHandlerMock()
+
+	serverHandler := handlers.NewServerHandler(
+		postgresHandler,
+		redisHandler,
+		mocks.NewRmqMock(),
+	)
+
+	_, err := serverHandler.SignIn(context.Background(), &proto.User{Email: "buyer", Password: "buyer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	md := metadata.New(map[string]string{"userID": "2"})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+
+
+	_, err = serverHandler.SellCurrency(ctx, &proto.SellOperation{
+		CurrencyValue: &proto.CurrencyValue{
+			Value:    amountToSell,
+			Currency: currencyToBuy,
+		},
+	})
+
+	if err == nil {
+		t.Fatal("can sell more currency than has corredpond USD amount")
+	}
+}

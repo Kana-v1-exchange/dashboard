@@ -1,6 +1,8 @@
 package mocks
 
 import (
+	"errors"
+
 	"github.com/jackc/pgx/v4"
 )
 
@@ -19,14 +21,14 @@ func NewPostgresHandlerMock() *PostgresHandlerMock {
 	return &PostgresHandlerMock{
 		users: map[uint64]user{
 			1: {
-				email: "seller",
+				email:    "seller",
 				password: "$2a$10$B4jIiCs429IUhk9g8cwsQuv8vQCNtTrpWGdaM7/ZNkk23keHI8HVG",
-				money: map[string]float64{"USD": 1000, "AUD": 1000},
+				money:    map[string]float64{"USD": 1000, "AUD": 1000},
 			},
 			2: {
-				email:    "buyer",
+				email: "buyer",
 				password: "$2a$10$P9clVRx8N/xttuRPTL4sq.emGf.1QXC5dlCAmVECTdQcjUtpL924G	",
-				money:    map[string]float64{"USD": 1000, "AUD": 1000},
+				money: map[string]float64{"USD": 1000, "AUD": 1000},
 			},
 		},
 		currencies: map[string]float64{"USD": 1, "AUD": 2},
@@ -97,9 +99,9 @@ func (phm *PostgresHandlerMock) GetUserMoney(userID uint64, currency string) (fl
 	return phm.users[userID].money[currency], nil
 }
 
-func (phm *PostgresHandlerMock) SendCurrency(sellerID, buyerID uint64, currency string, value float64) error {
-	phm.users[sellerID].money[currency] += value
-	phm.users[buyerID].money[currency] -= value
+func (phm *PostgresHandlerMock) SendCurrency(from, to uint64, currency string, value float64) error {
+	phm.users[to].money[currency] += value
+	phm.users[from].money[currency] -= value
 
 	return nil
 }
@@ -111,5 +113,5 @@ func (phm *PostgresHandlerMock) FindSeller(currency string, value float64) (uint
 		}
 	}
 
-	panic("user with such value of the currency does not exist")
+	return 0, errors.New("user with such value of the currency does not exist")
 }
