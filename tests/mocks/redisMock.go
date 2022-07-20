@@ -2,8 +2,10 @@ package mocks
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	redis "github.com/Kana-v1-exchange/enviroment/redis"
@@ -87,4 +89,18 @@ func (rhm *RedisHandlerMock) GetOrUpdateUserToken(userID uint64, expiresAt *time
 	}
 
 	return t, err
+}
+
+func (rhm *RedisHandlerMock) AddToList(key string, values ...string) error {
+	rhm.storage[key] = strings.Join(values, ";")
+	return nil
+}
+
+func (rhm *RedisHandlerMock) GetList(key string) ([]string, error) {
+	str, ok := rhm.storage[key]
+	if !ok {
+		return nil, errors.New("cannot find value by key")
+	}
+
+	return strings.Split(str, ";"), nil
 }

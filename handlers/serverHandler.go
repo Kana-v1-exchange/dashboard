@@ -14,6 +14,7 @@ import (
 	proto "github.com/Kana-v1-exchange/enviroment/protos/serverHandler"
 	redis "github.com/Kana-v1-exchange/enviroment/redis"
 	rmq "github.com/Kana-v1-exchange/enviroment/rmq"
+
 	"github.com/jackc/pgx/v4"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/metadata"
@@ -157,8 +158,9 @@ func (sh *ServerHandler) GetAllCurrencies(ctx context.Context, _ *proto.EmptyMsg
 func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOperation) (*proto.DefaultStringMsg, error) {
 	msg := make(chan *proto.DefaultStringMsg)
 	errCh := make(chan error)
+	transfered := make(chan float64, 1)
 
-	go func(msg chan *proto.DefaultStringMsg, errCh chan error) {
+	go func(msg chan *proto.DefaultStringMsg, transfered chan<- float64, errCh chan error) {
 		if md, ok := metadata.FromIncomingContext(ctx); ok {
 			buyerID, err := strconv.ParseUint(md.Get("userID")[0], 10, 64)
 			if err != nil {
@@ -221,20 +223,34 @@ func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOp
 				return
 			}
 
+			transfered <- usdToTransact / float64(sellInfo.CurrencyValue.Value)
 			msg <- &proto.DefaultStringMsg{Message: fmt.Sprintf("%v %v has been bought", sellInfo.CurrencyValue.Value, sellInfo.CurrencyValue.Currency)}
 		} else {
 			errCh <- fmt.Errorf("%wrequest doesn't contain metadata", helpers.ErrInternal)
 		}
-	}(msg, errCh)
+	}(msg, transfered, errCh)
 
 	select {
 	case <-ctx.Done():
 		return nil, fmt.Errorf("context has been canceled")
 	case message := <-msg:
-		err := sh.redisHandler.Increment(sellInfo.CurrencyValue.Currency + redis.RedisCurrencyOperationsSuffix)
-		if err != nil {
-			return nil, fmt.Errorf("%wcannot increment the number of the operations with the currency %v; err: %v", helpers.ErrInternal, sellInfo.CurrencyValue.Currency, err)
-		}
+		go func() {
+			err := sh.redisHandler.Increment(sellInfo.CurrencyValue.Currency + redis.RedisCurrencyOperationsSuffix)
+			if err != nil {
+				fmt.Println(fmt.Errorf("%wcannot increment the number of the operations with the currency %v; err: %v", helpers.ErrInternal, sellInfo.CurrencyValue.Currency, err))
+				return
+			}
+
+			pricesStr, err := json.Marshal(<-transfered)
+			if err != nil {
+				panic(err)
+			}
+
+			err = sh.redisHandler.AddToList(sellInfo.CurrencyValue.Currency+redis.RedisCurrencyPriceSuffix, string(pricesStr))
+			if err != nil {
+				panic(err)
+			}
+		}()
 
 		return message, nil
 	case err := <-errCh:
