@@ -7,7 +7,7 @@
             "driver": "PostgreSQL",
             "database": "exchange",
             "username": "user",
-            "password": "user",
+            "password": "password",
             "name": "exchange"
         }
     ]
