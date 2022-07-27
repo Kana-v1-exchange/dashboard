@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/Kana-v1-exchange/dashboard/helpers"
@@ -21,24 +20,22 @@ import (
 )
 
 type ServerHandler struct {
-	postgresHandler postgres.PostgresHandler
-	redisHandler    redis.RedisHandler
-	rmqHandler      rmq.RmqHandler
-
-	transaction *sync.Mutex
+	postgresHandler     postgres.PostgresHandler
+	transactionExecutor postgres.TransactionExecutor
+	redisHandler        redis.RedisHandler
+	rmqHandler          rmq.RmqHandler
 
 	proto.UnimplementedDashboardServiceServer
 }
 
 const tokenTime = 120
 
-func NewServerHandler(p postgres.PostgresHandler, r redis.RedisHandler, rmq rmq.RmqHandler) *ServerHandler {
+func NewServerHandler(p postgres.PostgresHandler, t postgres.TransactionExecutor, r redis.RedisHandler, rmq rmq.RmqHandler) *ServerHandler {
 	return &ServerHandler{
-		postgresHandler: p,
-		redisHandler:    r,
-		rmqHandler:      rmq,
-
-		transaction: new(sync.Mutex),
+		postgresHandler:     p,
+		transactionExecutor: t,
+		redisHandler:        r,
+		rmqHandler:          rmq,
 	}
 }
 
@@ -78,7 +75,7 @@ func (sh *ServerHandler) SignUp(ctx context.Context, user *proto.User) (*proto.D
 	case message := <-msg:
 		return &proto.DefaultStringMsg{Message: message}, nil
 	case err := <-errCh:
-		return nil, fmt.Errorf("cannot sign in; err: %v", err)
+		return nil, fmt.Errorf("cannot sign up; err: %v", err)
 	}
 }
 
@@ -109,7 +106,7 @@ func (sh *ServerHandler) SignIn(ctx context.Context, user *proto.User) (*proto.D
 			return
 		}
 
-		msg <- "succesfully signed in"
+		msg <- fmt.Sprintf("%v", userID)
 	}(msg, errCh)
 
 	select {
@@ -156,6 +153,10 @@ func (sh *ServerHandler) GetAllCurrencies(ctx context.Context, _ *proto.EmptyMsg
 }
 
 func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOperation) (*proto.DefaultStringMsg, error) {
+	if sellInfo.Currency == "USD" {
+		return nil, fmt.Errorf("cannot buy USD")
+	}
+
 	msg := make(chan *proto.DefaultStringMsg)
 	errCh := make(chan error)
 	transfered := make(chan float64, 1)
@@ -178,53 +179,72 @@ func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOp
 				return
 			}
 
-			sh.transaction.Lock()
-			defer sh.transaction.Unlock()
-
-			sellerID, err := sh.postgresHandler.FindSeller(sellInfo.CurrencyValue.Currency, float64(sellInfo.CurrencyValue.Value))
+			err = sh.transactionExecutor.LockMoney()
 			if err != nil {
 				errCh <- err
 				return
 			}
 
-			currencyVal, err := sh.postgresHandler.GetCurrencyValue(sellInfo.CurrencyValue.Currency)
+			sellers, err := sh.postgresHandler.FindSellers(sh.transactionExecutor, sellInfo.Currency, float64(sellInfo.Amount), float64(sellInfo.FloorPrice), float64(sellInfo.CeilPrice))
 			if err != nil {
 				errCh <- err
 				return
 			}
 
-			usdToTransact := currencyVal * float64(sellInfo.CurrencyValue.Value)
+			amountToPay := float64(0)
+			currencySum := float64(0)
 
+			for _, seller := range sellers {
+				err = sh.postgresHandler.GetMoneyFromSellingPool(
+					sh.transactionExecutor,
+					seller.Currency,
+					buyerID,
+					float64(sellInfo.Amount*(1-helpers.Fee)),
+					float64(sellInfo.FloorPrice),
+					float64(sellInfo.CeilPrice),
+				)
+
+				if err != nil {
+					sh.transactionExecutor.Rollback()
+					errCh <- fmt.Errorf("%vcannot buy currency. err: %w", helpers.ErrInternal, err)
+					return
+				}
+
+				err = sh.postgresHandler.SendMoney(sh.transactionExecutor, buyerID, seller.UserID, sellInfo.Currency, seller.Price*seller.Amount)
+				if err != nil {
+					sh.transactionExecutor.Rollback()
+					errCh <- fmt.Errorf("%vcannot send money to the seller. err: %w", helpers.ErrInternal, err)
+					return
+				}
+
+				currencySum += seller.Amount
+				amountToPay += seller.Price * seller.Amount
+			}
+
+			if currencySum < float64(sellInfo.Amount) {
+				sh.transactionExecutor.Rollback()
+				errCh <- fmt.Errorf("sellers do not have enough %v with such price. Need %v, have %v", sellInfo.Currency, sellInfo.Amount, currencySum)
+				return
+			}
 			availableUSD, err := sh.postgresHandler.GetUserMoney(buyerID, "USD")
 			if err != nil {
 				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
 				return
 			}
 
-			if availableUSD < usdToTransact {
-				errCh <- fmt.Errorf("user has %v USD, needs %v to buy %v %v", availableUSD, usdToTransact, sellInfo.CurrencyValue.Value, sellInfo.CurrencyValue.Currency)
+			if availableUSD < amountToPay {
+				sh.transactionExecutor.Rollback()
+				errCh <- fmt.Errorf("need %v USD. Has %v", amountToPay, availableUSD)
 				return
 			}
 
-			// send USD to a seller
-			err = sh.postgresHandler.SendCurrency(buyerID, sellerID, "USD", usdToTransact)
+			err = sh.transactionExecutor.Commit()
 			if err != nil {
 				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
 				return
 			}
 
-			// send currency to a buyer
-			err = sh.postgresHandler.SendCurrency(sellerID, buyerID, sellInfo.CurrencyValue.Currency, float64(sellInfo.CurrencyValue.Value))
-			if err != nil {
-				// rollback if error
-				sh.postgresHandler.SendCurrency(sellerID, buyerID, "USD", usdToTransact)
-
-				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
-				return
-			}
-
-			transfered <- usdToTransact / float64(sellInfo.CurrencyValue.Value)
-			msg <- &proto.DefaultStringMsg{Message: fmt.Sprintf("%v %v has been bought", sellInfo.CurrencyValue.Value, sellInfo.CurrencyValue.Currency)}
+			msg <- &proto.DefaultStringMsg{Message: fmt.Sprintf("%v %v has been bought", sellInfo.Amount, sellInfo.Currency)}
 		} else {
 			errCh <- fmt.Errorf("%wrequest doesn't contain metadata", helpers.ErrInternal)
 		}
@@ -235,9 +255,9 @@ func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOp
 		return nil, fmt.Errorf("context has been canceled")
 	case message := <-msg:
 		go func() {
-			err := sh.redisHandler.Increment(sellInfo.CurrencyValue.Currency + redis.RedisCurrencyOperationsSuffix)
+			err := sh.redisHandler.Increment(sellInfo.Currency + redis.RedisCurrencyOperationsSuffix)
 			if err != nil {
-				fmt.Println(fmt.Errorf("%wcannot increment the number of the operations with the currency %v; err: %v", helpers.ErrInternal, sellInfo.CurrencyValue.Currency, err))
+				fmt.Println(fmt.Errorf("%wcannot increment the number of the operations with the currency %v; err: %v", helpers.ErrInternal, sellInfo.Currency, err))
 				return
 			}
 
@@ -246,7 +266,7 @@ func (sh *ServerHandler) BuyCurrency(ctx context.Context, sellInfo *proto.SellOp
 				panic(err)
 			}
 
-			err = sh.redisHandler.AddToList(sellInfo.CurrencyValue.Currency+redis.RedisCurrencyPriceSuffix, string(pricesStr))
+			err = sh.redisHandler.AddToList(sellInfo.Currency+redis.RedisCurrencyPriceSuffix, string(pricesStr))
 			if err != nil {
 				panic(err)
 			}
@@ -286,66 +306,55 @@ func (sh *ServerHandler) SellCurrency(ctx context.Context, sellInfo *proto.SellO
 				return
 			}
 
-			currencyValue, err := sh.postgresHandler.GetCurrencyValue(sellInfo.CurrencyValue.Currency)
-			if err != nil {
-				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
-				return
-			}
-
-			usdToSell := currencyValue * float64(sellInfo.CurrencyValue.Value)
-			availableUSD, err := sh.postgresHandler.GetUserMoney(userID, "USD")
-			if err != nil {
-				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
-				return
-			}
-
-			if availableUSD < usdToSell {
-				errCh <- fmt.Errorf("user has %v USD, but wants to sell %v", availableUSD, usdToSell)
-				return
-			}
-
-			sh.transaction.Lock()
-			defer sh.transaction.Unlock()
-
-			err = sh.postgresHandler.UpdateCurrencyAmount(userID, "USD", availableUSD-usdToSell)
-			if err != nil {
-				errCh <- fmt.Errorf("%w%v", helpers.ErrInternal, err)
-			}
-
-			alreadyHave, err := sh.postgresHandler.GetUserMoney(userID, sellInfo.CurrencyValue.Currency)
+			alreadyHas, err := sh.postgresHandler.GetUserMoney(userID, sellInfo.Currency)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
-					alreadyHave = 0
+					alreadyHas = 0
 				} else {
 					errCh <- err
 					return
 				}
 			}
 
-			err = sh.postgresHandler.UpdateCurrencyAmount(userID, sellInfo.CurrencyValue.Currency, float64(sellInfo.CurrencyValue.Value)+alreadyHave)
-			if err != nil {
-				fullErr := fmt.Errorf("%w%v", helpers.ErrInternal, err)
-				err = sh.postgresHandler.UpdateCurrencyAmount(userID, "USD", availableUSD)
-				if err != nil {
-					fullErr = fmt.Errorf("%v. Also cannot rollback a transaction", fullErr)
-				}
-
-				errCh <- fullErr
+			if alreadyHas < float64(sellInfo.Amount) {
+				errCh <- fmt.Errorf("trying to sell(%v %v) more than has(%v %v)", sellInfo.Amount, sellInfo.Currency, alreadyHas, sellInfo.Currency)
+				return
 			}
+
+			err = sh.transactionExecutor.LockMoney()
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			err = sh.postgresHandler.AddMoneyToSellingPool(sh.transactionExecutor, sellInfo.Currency, userID, float64(sellInfo.Amount), float64(sellInfo.FloorPrice))
+			if err != nil {
+				sh.transactionExecutor.Rollback()
+				errCh <- fmt.Errorf("%vcannot seil currency; err: %w", helpers.ErrInternal, err)
+				return
+			}
+
+			err = sh.transactionExecutor.Commit()
+			if err != nil {
+				errCh <- err
+				return
+			}
+
 		} else {
 			errCh <- fmt.Errorf("%wrequest doesn't contain metadata", helpers.ErrInternal)
+			return
 		}
 
-		msg <- &proto.DefaultStringMsg{Message: fmt.Sprintf("%v %v selling now", sellInfo.CurrencyValue.Value, sellInfo.CurrencyValue.Currency)}
+		msg <- &proto.DefaultStringMsg{Message: fmt.Sprintf("%v %v selling now", sellInfo.Amount, sellInfo.Currency)}
 	}(msg, errCh)
 
 	select {
 	case <-ctx.Done():
 		return nil, fmt.Errorf("context has been canceled")
 	case message := <-msg:
-		err := sh.redisHandler.Increment(sellInfo.CurrencyValue.Currency + redis.RedisCurrencyOperationsSuffix)
+		err := sh.redisHandler.Increment(sellInfo.Currency + redis.RedisCurrencyOperationsSuffix)
 		if err != nil {
-			return nil, fmt.Errorf("%wcannot increment the number of the operations with the currency %v; err: %v", helpers.ErrInternal, sellInfo.CurrencyValue.Currency, err)
+			return nil, fmt.Errorf("%wcannot increment the number of the operations with the currency %v; err: %v", helpers.ErrInternal, sellInfo.Currency, err)
 		}
 
 		return message, nil
@@ -372,6 +381,52 @@ func (sh *ServerHandler) GetCurrencyValue(currency *proto.DefaultStringMsg, stre
 			stream.Send(&proto.DefaultFloatMsg{Value: parsedMessage.Value})
 		}
 	}
+}
+
+func (sh *ServerHandler) GetUserMoney(ctx context.Context, _ *proto.EmptyMsg) (*proto.GetCurrenciesResponse, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, fmt.Errorf("%wrequest doesn't contain metadata", helpers.ErrInternal)
+	}
+	userIDs := md.Get("userID")
+	if len(userIDs) == 0 {
+		return nil, fmt.Errorf("%wrequest contains %v userIDs instead of 1 metadata", helpers.ErrInternal, len(userIDs))
+	}
+
+	userID, err := strconv.ParseUint(userIDs[0], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("%wcannot get userID from the context metadata; err: %v", helpers.ErrInternal, err)
+	}
+
+	if err := sh.isUserAlive(userID); err != nil {
+		if errors.Is(err, helpers.ErrInternal) {
+			return nil, fmt.Errorf("%winternal err: %v", helpers.ErrInternal, err.Error())
+		} else {
+			return nil, err
+		}
+	}
+
+	currencies, err := sh.postgresHandler.GetCurrencies()
+	if err != nil {
+		return nil, fmt.Errorf("%winternal err: %v", helpers.ErrInternal, err.Error())
+	}
+
+	currencyValues := make([]*proto.CurrencyValue, 0, len(currencies))
+
+	for currency := range currencies {
+		amount, err := sh.postgresHandler.GetUserMoney(userID, currency)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%winternal err: %v", helpers.ErrInternal, err.Error())
+		}
+
+		currencyValues = append(currencyValues, &proto.CurrencyValue{Value: float32(amount), Currency: currency})
+	}
+
+	return &proto.GetCurrenciesResponse{CurrencyValue: currencyValues}, nil
+}
+
+func (sh *ServerHandler) GetUserHistory(context.Context, *proto.EmptyMsg) (*proto.GetUserHistoryResponse, error) {
+	return nil, errors.New("not implemented")
 }
 
 func (sh *ServerHandler) isUserAlive(userID uint64) error {

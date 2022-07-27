@@ -3,7 +3,7 @@ module github.com/Kana-v1-exchange/dashboard
 go 1.18
 
 require (
-	github.com/Kana-v1-exchange/enviroment v0.0.0-20220721105842-1015ffb2bdaf
+	github.com/Kana-v1-exchange/enviroment v0.0.0-20220727123448-5bf0a19e119e
 	google.golang.org/grpc v1.48.0
 	google.golang.org/protobuf v1.28.0
 )
@@ -12,6 +12,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.1.1 // indirect
 	github.com/desertbit/timer v0.0.0-20180107155436-c41aec40b27f // indirect
 	github.com/improbable-eng/grpc-web v0.15.0 // indirect
+	github.com/jackc/puddle v1.2.1 // indirect
 	github.com/klauspost/compress v1.11.7 // indirect
 	github.com/rs/cors v1.7.0 // indirect
 	nhooyr.io/websocket v1.8.6 // indirect

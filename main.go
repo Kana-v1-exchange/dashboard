@@ -24,8 +24,10 @@ func main() {
 	grpcServer := grpc.NewServer()
 	grpcWebServer := grpcweb.WrapServer(grpcServer)
 
+	postgresHandler, transExec := config.GetPostgresConfig().Connect()
+
 	grpcHandler := handlers.NewServerHandler(
-		config.GetPostgresConfig().Connect(),
+		postgresHandler, transExec,
 		config.GetRedisConfig().Connect(),
 		config.GetRmqConfig().Connect(),
 	)
@@ -35,7 +37,7 @@ func main() {
 	serverHandler := h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-User-Agent, X-Grpc-Web")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-User-Agent, X-Grpc-Web, userID")
 		w.Header().Set("grpc-status", "")
 		w.Header().Set("grpc-message", "")
 
