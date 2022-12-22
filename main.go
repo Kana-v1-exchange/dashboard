@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"os"
 
 	"github.com/Kana-v1-exchange/dashboard/config"
 	"github.com/Kana-v1-exchange/dashboard/handlers"
@@ -16,7 +17,7 @@ import (
 const port = ":11111"
 
 func main() {
-	err := godotenv.Load("./envs/.env")
+	err := godotenv.Load(getEnvFilePath())
 	if err != nil {
 		panic(err)
 	}
@@ -52,4 +53,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func getEnvFilePath() string {
+	if isExchangeLocal := os.Getenv("IS_EXCHANGE_IN_CONTAINER"); isExchangeLocal == "true" {
+		return ""
+	}
+
+	return "./envs/.env"
 }
