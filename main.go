@@ -17,9 +17,11 @@ import (
 const port = ":11111"
 
 func main() {
-	err := godotenv.Load(getEnvFilePath())
-	if err != nil {
-		panic(err)
+	if envFiles := getEnvFilePath(); len(envFiles) > 0 {
+		err := godotenv.Load(envFiles...)
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	grpcServer := grpc.NewServer()
@@ -55,10 +57,10 @@ func main() {
 	}
 }
 
-func getEnvFilePath() string {
+func getEnvFilePath() []string {
 	if isExchangeLocal := os.Getenv("IS_EXCHANGE_IN_CONTAINER"); isExchangeLocal == "false" {
-		return "./envs/.env"
+		return []string{"./envs/.env"}
 	}
 
-	return ""
+	return []string{}
 }
